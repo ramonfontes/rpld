@@ -174,7 +174,6 @@ static int config_load_dags(lua_State *L, struct iface *iface,
 	struct in6_addr dodagid;
 	struct in6_prefix dest;
 	uint8_t version, mop;
-	ev_tstamp trickle_t;
 	struct dag *dag;
 	int rc;
 
@@ -198,9 +197,10 @@ static int config_load_dags(lua_State *L, struct iface *iface,
 
 		lua_getfield(L, -1, "trickle_t");
 		if (lua_isnumber(L, -1)) {
-			trickle_t = lua_tonumber(L, -1);
+			iface->tickle_t = lua_tonumber(L, -1);
 		} else {
-			trickle_t = DEFAULT_TICKLE_T;
+			if (!iface->tickle_t)
+				iface->tickle_t = DEFAULT_TICKLE_T;
 		}
 		lua_pop(L, 1);
 
@@ -236,8 +236,7 @@ static int config_load_dags(lua_State *L, struct iface *iface,
 
 		lua_pop(L, 1);
 
-		dag = dag_create(iface, instanceid, &dodagid,
-				 trickle_t, 1, version, mop, &dest);
+		dag = dag_create(iface, instanceid, &dodagid, 1, version, mop, &dest);
 		if (!dag)
 			return -1;
 
@@ -397,6 +396,18 @@ int config_load(const char *filename, struct list_head *ifaces)
 		/* TODO because compression might be different here... */
 		iface->ifaddr_src = &iface->ifaddr;
 		iface->ifaddrs_count = rc;
+
+		lua_getfield(L, -1, "mode_of_operation");
+		iface->mop = lua_tonumber(L, -1);
+		lua_pop(L, 1);
+
+		lua_getfield(L, -1, "trickle_t");
+		if (lua_isnumber(L, -1)) {
+			iface->tickle_t = lua_tonumber(L, -1);
+		} else {
+			iface->tickle_t = DEFAULT_TICKLE_T;
+		}
+		lua_pop(L, 1);
 
 		lua_getfield(L, -1, "dodag_root");
 		if (!lua_isboolean(L, -1)) {

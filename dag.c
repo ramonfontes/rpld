@@ -175,7 +175,7 @@ void dag_init_timer(struct dag *dag);
 
 static int dag_init(struct dag *dag, const struct iface *iface,
 		    const struct rpl *rpl, const struct in6_addr *dodagid,
-		    ev_tstamp trickle_t, uint16_t my_rank, uint8_t version,
+		    uint16_t my_rank, uint8_t version,
 		    uint8_t mop, const struct in6_prefix *dest)
 {
 	/* TODO dest is currently necessary */
@@ -191,7 +191,7 @@ static int dag_init(struct dag *dag, const struct iface *iface,
 
 	dag->version = version;
 	dag->my_rank = my_rank;
-	dag->trickle_t = DEFAULT_TICKLE_T;
+	dag->trickle_t = iface->tickle_t;
 	dag->mop = mop;
 
 	dag_init_timer(dag);
@@ -201,7 +201,7 @@ static int dag_init(struct dag *dag, const struct iface *iface,
 }
 
 struct dag *dag_create(struct iface *iface, uint8_t instanceid,
-		       const struct in6_addr *dodagid, ev_tstamp trickle_t,
+		       const struct in6_addr *dodagid,
 		       uint16_t my_rank, uint8_t version, uint8_t mop,
 		       const struct in6_prefix *dest)
 {
@@ -236,7 +236,7 @@ struct dag *dag_create(struct iface *iface, uint8_t instanceid,
 		return NULL;
 	}
 
-	rc = dag_init(dag, iface, rpl, dodagid, trickle_t,
+	rc = dag_init(dag, iface, rpl, dodagid,
 		      my_rank, version, mop, dest);
 	if (rc != 0) {
 		free(dag);

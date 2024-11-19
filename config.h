@@ -48,6 +48,7 @@ struct iface {
 	bool dodag_root;
 
 	struct list list;
+	int tickle_t;
 };
 
 int config_load(const char *filename, struct list_head *ifaces);
