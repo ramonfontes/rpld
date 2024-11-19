@@ -48,6 +48,7 @@ struct iface {
 	bool dodag_root;
 
 	struct list list;
+	uint8_t mop;
 	int tickle_t;
 };
 
