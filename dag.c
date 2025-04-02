@@ -71,10 +71,8 @@ static struct child *dag_lookup_child(const struct dag *dag,
 				      const struct in6_addr *addr)
 {
 	struct child *peer;
-	struct list *p;
 
-	DL_FOREACH(dag->childs.head, p) {
-		peer = container_of(p, struct child, list);
+	list_for_each_entry(peer, &dag->childs, list) {
 		if (dag_is_child(peer, addr))
 			return peer;
 	}
@@ -103,10 +101,8 @@ static struct rpl *dag_lookup_rpl(const struct iface *iface,
 				  uint8_t instance_id)
 {
 	struct rpl *rpl;
-	struct list *r;
 
-	DL_FOREACH(iface->rpls.head, r) {
-		rpl = container_of(r, struct rpl, list);
+	list_for_each_entry(rpl, &iface->rpls, list) {
 		if (rpl->instance_id == instance_id)
 			return rpl;
 	}
@@ -118,11 +114,8 @@ static struct dag *dag_lookup_dodag(const struct rpl *rpl,
 				    const struct in6_addr *dodagid)
 {
 	struct dag *dag;
-	struct list *d;
 
-	DL_FOREACH(rpl->dags.head, d) {
-		dag = container_of(d, struct dag, list);
-
+	list_for_each_entry(dag, &rpl->dags, list) {
 		if (!memcmp(&dag->dodagid, dodagid, sizeof(dag->dodagid)))
 			return dag;
 	}
@@ -157,11 +150,8 @@ static struct rpl *dag_rpl_create(uint8_t instance_id)
 struct dag_daoack *dag_lookup_daoack(const struct dag *dag, uint8_t dsn)
 {
 	struct dag_daoack *daoack;
-	struct list *d;
 
-	DL_FOREACH(dag->pending_acks.head, d) {
-		daoack = container_of(d, struct dag_daoack, list);
-
+	list_for_each_entry(daoack, &dag->pending_acks, list) {
 		if (daoack->dsn == dsn)
 			return daoack;
 	}
@@ -185,8 +175,8 @@ void dag_init_timer(struct dag *dag);
 
 static int dag_init(struct dag *dag, const struct iface *iface,
 		    const struct rpl *rpl, const struct in6_addr *dodagid,
-		    ev_tstamp trickle_t, uint16_t my_rank, uint8_t version,
-		    const struct in6_prefix *dest)
+		    uint16_t my_rank, uint8_t version,
+		    uint8_t mop, const struct in6_prefix *dest)
 {
 	/* TODO dest is currently necessary */
 	if (!dag || !iface || !rpl || !dest)
@@ -201,16 +191,18 @@ static int dag_init(struct dag *dag, const struct iface *iface,
 
 	dag->version = version;
 	dag->my_rank = my_rank;
-	dag->trickle_t = DEFAULT_TICKLE_T;
+	dag->trickle_t = iface->tickle_t;
+	dag->mop = mop;
 
 	dag_init_timer(dag);
+	t_init(&dag->root, &iface->ifaddr, dodagid);
 
 	return 0;
 }
 
 struct dag *dag_create(struct iface *iface, uint8_t instanceid,
-		       const struct in6_addr *dodagid, ev_tstamp trickle_t,
-		       uint16_t my_rank, uint8_t version,
+		       const struct in6_addr *dodagid,
+		       uint16_t my_rank, uint8_t version, uint8_t mop,
 		       const struct in6_prefix *dest)
 {
 	bool append_rpl = false;
@@ -244,8 +236,8 @@ struct dag *dag_create(struct iface *iface, uint8_t instanceid,
 		return NULL;
 	}
 
-	rc = dag_init(dag, iface, rpl, dodagid, trickle_t,
-		      my_rank, version, dest);
+	rc = dag_init(dag, iface, rpl, dodagid,
+		      my_rank, version, mop, dest);
 	if (rc != 0) {
 		free(dag);
 		free(rpl);
@@ -261,6 +253,7 @@ struct dag *dag_create(struct iface *iface, uint8_t instanceid,
 
 void dag_free(struct dag *dag)
 {
+	t_free(&dag->root);
 	free(dag);
 }
 
@@ -306,7 +299,7 @@ void dag_build_dio(struct dag *dag, struct safe_buffer *sb)
 	dio.rpl_dtsn = dag->dtsn++;
 	flog(LOG_INFO, "my_rank %d", dag->my_rank);
 	dio.rpl_dagrank = htons(dag->my_rank);
-	dio.rpl_mopprf = ND_RPL_DIO_GROUNDED | RPL_DIO_STORING_NO_MULTICAST << 3;
+	dio.rpl_mopprf = ND_RPL_DIO_GROUNDED | (dag->mop << 3);
 	dio.rpl_dagid = dag->dodagid;
 
 	safe_buffer_append(sb, &dio, sizeof(dio));
@@ -372,12 +365,28 @@ static int append_target(const struct in6_prefix *prefix,
 	return 0;
 }
 
+static int append_transit(const struct in6_addr *parent,
+			   struct safe_buffer *sb)
+{
+	struct rpl_dao_transit transit = {};
+	uint8_t len;
+
+	len = sizeof(transit);
+	transit.type = RPL_DAO_TRANSITINFO;
+
+	/* TODO crazy calculation here */
+	transit.len = 20;
+	transit.parent = *parent;
+	safe_buffer_append(sb, &transit, len);
+
+	return 0;
+}
+
 void dag_build_dao(struct dag *dag, struct safe_buffer *sb)
 {
 	struct nd_rpl_daoack daoack = {};
 	struct in6_prefix prefix;
 	const struct child *child;
-	const struct list *c;
 
 	dag_build_icmp(sb, ND_RPL_DAO);
 
@@ -389,13 +398,21 @@ void dag_build_dao(struct dag *dag, struct safe_buffer *sb)
 	prefix.prefix = dag->self;
 	prefix.len = 128;
 	append_target(&prefix, sb);
+	append_transit(&dag->parent->addr, sb);
 
-	DL_FOREACH(dag->childs.head, c) {
-		child = container_of(c, struct child, list);
-		prefix.prefix = child->addr;
-		prefix.len = 128;
+	switch (dag->mop) {
+	case RPL_DIO_STORING_NO_MULTICAST:
+		/* fall-through */
+	case RPL_DIO_STORING_MULTICAST:
+		list_for_each_entry(child, &dag->childs, list) {
+			prefix.prefix = child->addr;
+			prefix.len = 128;
 
-		append_target(&prefix, sb);
+			append_target(&prefix, sb);
+		}
+		break;
+	default:
+		break;
 	}
 
 	dag_daoack_insert(dag, dag->dsn);

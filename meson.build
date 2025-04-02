@@ -1,6 +1,8 @@
 project('rpld', 'c')
 compiler = meson.get_compiler('c')
 
+incdir = include_directories('include')
+
 evdep = dependency('ev', required: false)
 if evdep.found()
 	evdep = [ libev ]
@@ -34,8 +36,12 @@ srcs = files(
 	'netlink.c',
 	'dag.c',
 	'log.c',
+	'tree.c',
 )
 
-executable('rpld', srcs, dependencies : [ evdep, luadep, mnldep ])
+executable('rpld', srcs, include_directories : incdir, dependencies : [ evdep, luadep, mnldep ], install: true)
+
+e = executable('prog', files('testprog.c', 'tree.c'))
+test('Some unit tests with asserts', e)
 
 # vim: syntax=python

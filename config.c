@@ -21,6 +21,7 @@
 #include "netlink.h"
 #include "config.h"
 #include "log.h"
+#include "rpl.h"
 
 static inline int cmp_iface_addrs(void const *a, void const *b)
 {
@@ -137,15 +138,11 @@ struct dag *iface_find_dag(const struct list_head *dags, uint16_t inst_id)
 }
 #endif
 
-struct iface *iface_find_by_ifindex(const struct list_head *ifaces,
-				    uint32_t ifindex)
+struct iface *iface_find_by_ifindex(struct list_head *ifaces, uint32_t ifindex)
 {
 	struct iface *iface;
-	struct list *e;
 
-	DL_FOREACH(ifaces->head, e) {
-		iface = container_of(e, struct iface, list);
-
+	list_for_each_entry(iface, ifaces, list) {
 		if (iface->ifindex == ifindex)
 			return iface;
 	}
@@ -176,8 +173,7 @@ static int config_load_dags(lua_State *L, struct iface *iface,
 {
 	struct in6_addr dodagid;
 	struct in6_prefix dest;
-	ev_tstamp trickle_t;
-	uint8_t version;
+	uint8_t version, mop;
 	struct dag *dag;
 	int rc;
 
@@ -201,9 +197,10 @@ static int config_load_dags(lua_State *L, struct iface *iface,
 
 		lua_getfield(L, -1, "trickle_t");
 		if (lua_isnumber(L, -1)) {
-			trickle_t = lua_tonumber(L, -1);
+			iface->tickle_t = lua_tonumber(L, -1);
 		} else {
-			trickle_t = DEFAULT_TICKLE_T;
+			if (!iface->tickle_t)
+				iface->tickle_t = DEFAULT_TICKLE_T;
 		}
 		lua_pop(L, 1);
 
@@ -228,10 +225,18 @@ static int config_load_dags(lua_State *L, struct iface *iface,
 		}
 		lua_pop(L, 1);
 
+		/* TODO also check string then to num */
+		lua_getfield(L, -1, "mode_of_operation");
+		if (lua_isnumber(L, -1)) {
+			mop = lua_tonumber(L, -1);
+		} else {
+			mop = RPL_DIO_STORING_NO_MULTICAST;
+		}
 		lua_pop(L, 1);
 
-		dag = dag_create(iface, instanceid, &dodagid,
-				 trickle_t, 1, version, &dest);
+		lua_pop(L, 1);
+
+		dag = dag_create(iface, instanceid, &dodagid, 1, version, mop, &dest);
 		if (!dag)
 			return -1;
 
@@ -270,6 +275,55 @@ static int config_load_instances(lua_State *L, struct iface *iface)
 	lua_pop(L, 1);
 
 	return 0;
+}
+
+static int config_set_sysfs(const struct iface *iface)
+{
+	int rc;
+
+#if 1
+	/* TODO check why we need that to all? */
+	rc = set_interface_var("all",
+			       PROC_SYS_IP6_IFACE_FORWARDING,
+			       "forwarding", 1);
+#else
+	rc = set_interface_var(iface->ifname,
+			       PROC_SYS_IP6_IFACE_FORWARDING,
+			       "forwarding", 1);
+#endif
+	if (rc == -1) {
+		flog(LOG_ERR, "Failed to set forwarding");
+		goto out;
+	}
+
+	rc = set_interface_var("all",
+			       PROC_SYS_IP6_IFACE_ACCEPT_SOURCE_ROUTE,
+			       "accept_source_route", 1);
+	if (rc == -1)
+		goto warn;
+
+	rc = set_interface_var(iface->ifname,
+			       PROC_SYS_IP6_IFACE_ACCEPT_SOURCE_ROUTE,
+			       "accept_source_route", 1);
+	if (rc == -1)
+		goto warn;
+
+	rc = set_interface_var(iface->ifname,
+			       PROC_SYS_IP6_IFACE_RPL_SEG_ENABLED,
+			       "rpl_seg_enabled", 1);
+	if (rc == -1)
+		goto warn;
+
+	rc = set_interface_var("all",
+			       PROC_SYS_IP6_IFACE_RPL_SEG_ENABLED,
+			       "rpl_seg_enabled", 1);
+warn:
+	if (rc == -1)
+		flog(LOG_ERR, "Failed to set segmentation route settings");
+
+	rc = 0;
+out:
+	return rc;
 }
 
 int config_load(const char *filename, struct list_head *ifaces)
@@ -314,18 +368,9 @@ int config_load(const char *filename, struct list_head *ifaces)
 
 		strncpy(iface->ifname, lua_tostring(L, -1), IFNAMSIZ);
 		lua_pop(L, 1);
-#if 1
-		/* TODO check why we need that to all? */
-		rc = set_interface_var("all",
-				       PROC_SYS_IP6_IFACE_FORWARDING,
-				       "forwarding", 1);
-#else
-		rc = set_interface_var(iface->ifname,
-				       PROC_SYS_IP6_IFACE_FORWARDING,
-				       "forwarding", 1);
-#endif
+
+		rc = config_set_sysfs(iface);
 		if (rc == -1) {
-			flog(LOG_ERR, "Failed to set forwarding");
 			iface_free(iface);
 			lua_close(L);
 			return -1;
@@ -351,6 +396,18 @@ int config_load(const char *filename, struct list_head *ifaces)
 		/* TODO because compression might be different here... */
 		iface->ifaddr_src = &iface->ifaddr;
 		iface->ifaddrs_count = rc;
+
+		lua_getfield(L, -1, "mode_of_operation");
+		iface->mop = lua_tonumber(L, -1);
+		lua_pop(L, 1);
+
+		lua_getfield(L, -1, "trickle_t");
+		if (lua_isnumber(L, -1)) {
+			iface->tickle_t = lua_tonumber(L, -1);
+		} else {
+			iface->tickle_t = DEFAULT_TICKLE_T;
+		}
+		lua_pop(L, 1);
 
 		lua_getfield(L, -1, "dodag_root");
 		if (!lua_isboolean(L, -1)) {
@@ -382,13 +439,10 @@ int config_load(const char *filename, struct list_head *ifaces)
 
 void config_free(struct list_head *ifaces)
 {
-	struct list *e, *tmp;
-	struct iface *iface;
+	struct iface *iface, *tmp;
 
-	DL_FOREACH_SAFE(ifaces->head, e, tmp) {
-		iface = container_of(e, struct iface, list);
+	list_for_each_entry_safe(iface, tmp, ifaces, list) {
 		iface_free(iface);
-
-		DL_DELETE(ifaces->head, e);
+		list_del(ifaces, &iface->list);
 	}
 }
