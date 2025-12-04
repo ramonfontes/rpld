@@ -128,6 +128,68 @@ static int rpld_setup(struct ev_loop *loop, struct list_head *ifaces)
 	return 0;
 }
 
+/* read a new trickle interval (seconds) from file, return >0 on success */
+static double read_trickle_config(const char *path)
+{
+    FILE *f;
+    double val = -1.0;
+
+    f = fopen(path, "r");
+    if (!f)
+        return -1.0;
+
+    /* expected line: trickle_t=1.5  (seconds) */
+    if (fscanf(f, "trickle_t=%lf", &val) != 1) {
+        /* try an alternative: just a number in file */
+        rewind(f);
+        if (fscanf(f, "%lf", &val) != 1)
+            val = -1.0;
+    }
+
+    fclose(f);
+    return val;
+}
+
+/* reload handler for SIGUSR1: update trickle_t for all dags and restart timers */
+static void reload_cb(struct ev_loop *loop, ev_signal *w, int revents)
+{
+    struct iface *iface;
+    struct rpl *rpl;
+    struct dag *dag;
+    double new_trickle_t;
+    const char *conf = "/tmp/rpld_trickle.conf";
+
+    flog(LOG_INFO, "Received SIGUSR1: reloading trickle configuration from %s", conf);
+
+    new_trickle_t = read_trickle_config(conf);
+    if (new_trickle_t <= 0.0) {
+        flog(LOG_WARNING, "Invalid trickle value in %s; ignoring", conf);
+        return;
+    }
+
+    /* iterate over all interfaces/rpls/dags and update trickle_t */
+    list_for_each_entry(iface, &ifaces, list) {
+        list_for_each_entry(rpl, &iface->rpls, list) {
+            list_for_each_entry(dag, &rpl->dags, list) {
+                /* set new interval value in dag */
+                dag->trickle_t = new_trickle_t;
+
+                /* restart the libev timer for this dag:
+                   stop -> set new values -> start
+                */
+                ev_timer_stop(loop, &dag->trickle_w);
+                ev_timer_set(&dag->trickle_w, dag->trickle_t, dag->trickle_t);
+                ev_timer_start(loop, &dag->trickle_w);
+
+                flog(LOG_INFO, "Updated dag %p trickle_t to %f", dag->parent, dag->trickle_t);
+            }
+        }
+    }
+
+    flog(LOG_INFO, "Trickle reload complete");
+}
+
+
 int main(int argc, char *argv[])
 {
 	char const *conf_path = PATH_RPLD_CONF;
@@ -191,6 +253,11 @@ int main(int argc, char *argv[])
 	init_random_gen();
 	ev_signal_init(&exitsig, sigint_cb, SIGINT);
 	ev_signal_start(loop, &exitsig);
+
+	/* register SIGUSR1 to allow dynamic trickle reloads */
+	static ev_signal reloadsig;
+	ev_signal_init(&reloadsig, reload_cb, SIGUSR1);
+	ev_signal_start(loop, &reloadsig);
 
 	if (log_method == L_UNSPEC)
 		log_method = L_STDERR;
